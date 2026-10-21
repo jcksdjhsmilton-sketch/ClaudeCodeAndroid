@@ -23,6 +23,9 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: read
+
 concurrency:
   group: apk-${{ github.ref }}
   cancel-in-progress: true
@@ -70,10 +73,10 @@ jobs:
           set -euo pipefail
           B="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}"
           mkdir -p dl rootfs android/app/src/main/assets
-          FILE=$(curl -fsSL "$B/releases/aarch64/latest-releases.yaml" | grep -o 'alpine-minirootfs-[0-9.]*-aarch64\.tar\.gz' | sort -uV | tail -1 || true)
+          FILE=$(curl -fsSL --retry 3 --retry-delay 2 "$B/releases/aarch64/latest-releases.yaml" | grep -o 'alpine-minirootfs-[0-9.]*-aarch64\.tar\.gz' | sort -uV | tail -1 || true)
           [ -n "$FILE" ] || { echo "minirootfs nao encontrado"; exit 1; }
           echo "minirootfs: $FILE"
-          curl -fsSL -o dl/mini.tgz "$B/releases/aarch64/$FILE"
+          curl -fsSL --retry 3 --retry-delay 2 -o dl/mini.tgz "$B/releases/aarch64/$FILE"
           sudo tar -xzf dl/mini.tgz -C rootfs
           # proot nao existe no Alpine v3.22 (so entrou no "community" nas versoes novas),
           # entao procuramos em varias branches e baixamos proot + talloc da MESMA branch.
@@ -94,7 +97,8 @@ jobs:
           for PKG in proot talloc; do
             URL=$(find_pkg "$PKG" "$PB") || { echo "pacote $PKG nao encontrado em $PB"; exit 1; }
             echo "baixando $URL"
-            curl -fsSL -o "dl/$PKG.apk" "$URL"
+            curl -fsSL --retry 3 --retry-delay 2 -o "dl/$PKG.apk" "$URL"
+            tar -tzf "dl/$PKG.apk" >/dev/null 2>&1 || { echo "$PKG.apk nao e um tar.gz valido (formato de pacote nao suportado)"; exit 1; }
             sudo tar -xzf "dl/$PKG.apk" -C rootfs --exclude='.PKGINFO' --exclude='.SIGN.*' --exclude='.post-*' --exclude='.pre-*' --exclude='.trigger' 2>/dev/null || true
           done
           test -f rootfs/usr/bin/proot
@@ -330,6 +334,7 @@ jobs:
           import java.io.IOException
           import java.nio.file.Files
           import java.nio.file.LinkOption
+          import java.util.concurrent.TimeUnit
           import java.util.zip.GZIPInputStream
           import kotlin.properties.ReadWriteProperty
           import kotlin.reflect.KProperty
@@ -476,28 +481,56 @@ jobs:
               }
           }
 
+          fun loaderPath(ctx: Context): String? {
+              val r = Env(ctx).root
+              for (p in listOf("usr/libexec/proot/loader", "usr/lib/proot/loader", "usr/local/libexec/proot/loader")) {
+                  val f = File(r, p)
+                  if (f.exists()) return f.path
+              }
+              return null
+          }
+
+          fun applyProotEnv(pb: ProcessBuilder, ctx: Context) {
+              val e = Env(ctx)
+              val m = pb.environment()
+              m.remove("LD_LIBRARY_PATH"); m.remove("LD_PRELOAD")
+              m["PROOT_TMP_DIR"] = e.tmp.path
+              m["PROOT_NO_SECCOMP"] = "1"
+              m["TMPDIR"] = e.tmp.path
+              val ld = loaderPath(ctx)
+              if (ld != null) m["PROOT_LOADER"] = ld
+          }
+
+          // Modo do proot escolhido na instalacao (0 = completo ... 3 = minimo).
+          fun prootVariant(ctx: Context): Int =
+              try { File(ctx.filesDir, "proot.variant").readText().trim().toInt() } catch (_: Exception) { 0 }
+
           private fun buildCmd(ctx: Context, inner: String, cwd: String, env: Map<String, String>): List<String> {
               val e = Env(ctx)
               val r = e.root.path
+              val v = prootVariant(ctx)
               val l = ArrayList<String>()
               l += "$r/lib/ld-musl-aarch64.so.1"
               l += "--library-path"; l += "$r/usr/lib:$r/lib"
               l += "$r/usr/bin/proot"
-              l += listOf(
-                  "-0", "--link2symlink", "--kill-on-exit", "-r", r,
-                  "-b", "/dev", "-b", "/proc", "-b", "/sys",
+              l += "-0"
+              if (v < 1) l += "--link2symlink"
+              if (v < 2) l += "--kill-on-exit"
+              l += listOf("-r", r, "-b", "/dev", "-b", "/proc")
+              if (v < 2) l += listOf("-b", "/sys")
+              if (v < 3) l += listOf(
                   "-b", "${e.fake.path}/stat:/proc/stat",
                   "-b", "${e.fake.path}/loadavg:/proc/loadavg",
-                  "-b", "${e.fake.path}/uptime:/proc/uptime",
-                  "-w", cwd
+                  "-b", "${e.fake.path}/uptime:/proc/uptime"
               )
+              l += listOf("-w", cwd)
               l += listOf(
                   "/usr/bin/env", "-i",
                   "HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/sh", "TERM=dumb",
                   "LANG=C.UTF-8", "TMPDIR=/tmp",
                   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
               )
-              env.forEach { (k, v) -> l += "$k=$v" }
+              env.forEach { (k, v2) -> l += "$k=$v2" }
               l += listOf("/bin/sh", "-c", inner)
               return l
           }
@@ -518,12 +551,7 @@ jobs:
               val pb = ProcessBuilder(buildCmd(ctx, inner, cwd, env))
                   .directory(ctx.filesDir)
                   .redirectErrorStream(true)
-              pb.environment().apply {
-                  remove("LD_LIBRARY_PATH"); remove("LD_PRELOAD")
-                  put("PROOT_TMP_DIR", e.tmp.path)
-                  put("PROOT_NO_SECCOMP", "1")
-                  put("TMPDIR", e.tmp.path)
-              }
+              applyProotEnv(pb, ctx)
               val p = pb.start()
               val reader = launch(Dispatchers.IO) {
                   try {
@@ -593,48 +621,53 @@ jobs:
 
               private suspend fun sh(ctx: Context, script: String): String {
                   var last = ""
+                  val tail = ArrayList<String>()
                   var code = -1
                   execFlow(ctx, script).collect { o ->
                       if (o is Out.Line) {
-                          if (o.s.isNotBlank()) last = o.s
+                          if (o.s.isNotBlank()) { last = o.s; tail.add(o.s); if (tail.size > 4) tail.removeAt(0) }
                           InstallState.add(o.s)
                       } else if (o is Out.Code) {
                           code = o.c
                       }
                   }
-                  if (code != 0) throw IOException("Falha (código $code): $last")
+                  if (code != 0) throw IOException("Falha (código $code): " + (if (tail.isEmpty()) "processo sem saída" else tail.joinToString(" | ").take(400)))
                   return last
               }
 
-              // Diagnostico: roda o proot "cru" e joga a saida no log da tela de instalacao.
-              private fun diag(ctx: Context) {
-                  try {
-                      val e = Env(ctx)
-                      val r = e.root.path
-                      fun probe(vararg extra: String) {
-                          val cmd = ArrayList<String>()
-                          cmd += "$r/lib/ld-musl-aarch64.so.1"
-                          cmd += "--library-path"
-                          cmd += "$r/usr/lib:$r/lib"
-                          cmd += "$r/usr/bin/proot"
-                          cmd.addAll(extra)
-                          val pb = ProcessBuilder(cmd).directory(ctx.filesDir).redirectErrorStream(true)
-                          pb.environment().apply {
-                              remove("LD_LIBRARY_PATH"); remove("LD_PRELOAD")
-                              put("PROOT_TMP_DIR", e.tmp.path)
-                              put("PROOT_NO_SECCOMP", "1")
-                          }
+              // Testa os modos do proot (do mais completo ao minimo) com o MESMO comando usado de verdade
+              // e fixa o primeiro que consegue executar "echo ok" dentro do Linux embutido.
+              private fun probeVariant(ctx: Context) {
+                  val vf = File(ctx.filesDir, "proot.variant")
+                  var lastOut = ""
+                  for (v in 0..3) {
+                      vf.writeText(v.toString())
+                      try {
+                          val pb = ProcessBuilder(buildCmd(ctx, "echo ok", "/root", emptyMap()))
+                              .directory(ctx.filesDir).redirectErrorStream(true)
+                          applyProotEnv(pb, ctx)
                           val pr = pb.start()
-                          val out = pr.inputStream.bufferedReader().readText().trim().lines().filter { it.isNotBlank() }.takeLast(3)
-                          val c = pr.waitFor()
-                          InstallState.add("[diag] " + extra.take(2).joinToString(" ") + " -> codigo " + c)
-                          out.forEach { InstallState.add("[diag] " + it.take(110)) }
+                          try { pr.outputStream.close() } catch (_: IOException) {}
+                          val sb = StringBuilder()
+                          val th = Thread { try { sb.append(pr.inputStream.bufferedReader().readText()) } catch (_: Exception) {} }
+                          th.start()
+                          val done = pr.waitFor(25, TimeUnit.SECONDS)
+                          if (!done) pr.destroyForcibly()
+                          th.join(3000)
+                          val out = sb.toString().trim()
+                          val code = if (done) pr.exitValue() else -1
+                          InstallState.add("[proot] modo $v -> código $code")
+                          out.lines().filter { it.isNotBlank() }.takeLast(2).forEach { InstallState.add("[proot] " + it.take(110)) }
+                          if (done && code == 0 && out.lines().any { it.trim() == "ok" }) return
+                          lastOut = out
+                      } catch (t: Throwable) {
+                          InstallState.add("[proot] modo $v erro: " + t.message)
+                          lastOut = t.message ?: ""
                       }
-                      probe("--version")
-                      probe("-v", "1", "-0", "--link2symlink", "-r", r, "-w", "/", "/bin/sh", "-c", "echo ok")
-                  } catch (t: Throwable) {
-                      InstallState.add("[diag] erro: " + t.message)
                   }
+                  vf.delete()
+                  throw IOException("O proot não conseguiu iniciar o Linux em nenhum modo. Saída: " +
+                      lastOut.lines().filter { it.isNotBlank() }.takeLast(3).joinToString(" | ").take(300))
               }
 
               suspend fun run(ctx: Context) {
@@ -654,12 +687,8 @@ jobs:
                       st.step.value = 1
                       withContext(Dispatchers.IO) { prepareFake(ctx) }
                       st.step.value = 2
-                      try {
+                      withContext(Dispatchers.IO) { probeVariant(ctx) }
                           sh(ctx, SCRIPT_APK)
-                      } catch (t: IOException) {
-                          withContext(Dispatchers.IO) { diag(ctx) }
-                          throw t
-                      }
                       st.step.value = 3
                       sh(ctx, SCRIPT_NPM)
                       st.step.value = 4
@@ -1177,9 +1206,9 @@ jobs:
                   if (log.isNotEmpty()) {
                       Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(cs.surfaceVariant).padding(12.dp)) {
                           Text(
-                              log.takeLast(8).joinToString("\n"),
+                              log.takeLast(14).joinToString("\n"),
                               fontFamily = FontFamily.Monospace, fontSize = 11.sp, lineHeight = 15.sp,
-                              color = cs.onSurfaceVariant, maxLines = 8, overflow = TextOverflow.Ellipsis
+                              color = cs.onSurfaceVariant, maxLines = 28, overflow = TextOverflow.Ellipsis
                           )
                       }
                       Spacer(Modifier.height(16.dp))
@@ -1687,7 +1716,7 @@ jobs:
           echo "--- assets dentro do APK ---"
           grep -i 'assets/' apk-list.txt || true
           if ! grep -qi 'rootfs' apk-list.txt; then
-            echo "AVISO: rootfs nao encontrado na listagem do APK (o app nao vai conseguir instalar o Linux embutido)"
+            echo "ERRO: rootfs nao encontrado no APK (o app nao conseguiria instalar o Linux embutido)"; exit 1
           fi
           mkdir -p out
           cp "$APK" out/ClaudeCodeMobile.apk
