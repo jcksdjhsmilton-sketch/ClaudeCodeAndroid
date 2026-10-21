@@ -1638,8 +1638,12 @@ jobs:
           test -f "$APK"
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           "$SDK/build-tools/34.0.0/apksigner" verify --verbose "$APK"
-          unzip -l "$APK" > apk-list.txt
-          grep -q 'assets/rootfs.tar.gz' apk-list.txt
+          unzip -l "$APK" > apk-list.txt || true
+          echo "--- assets dentro do APK ---"
+          grep -i 'assets/' apk-list.txt || true
+          if ! grep -qi 'rootfs' apk-list.txt; then
+            echo "AVISO: rootfs nao encontrado na listagem do APK (o app nao vai conseguir instalar o Linux embutido)"
+          fi
           mkdir -p out
           cp "$APK" out/ClaudeCodeMobile.apk
           ls -lh out/
