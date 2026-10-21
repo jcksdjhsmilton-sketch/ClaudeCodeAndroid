@@ -606,6 +606,37 @@ jobs:
                   return last
               }
 
+              // Diagnostico: roda o proot "cru" e joga a saida no log da tela de instalacao.
+              private fun diag(ctx: Context) {
+                  try {
+                      val e = Env(ctx)
+                      val r = e.root.path
+                      fun probe(vararg extra: String) {
+                          val cmd = ArrayList<String>()
+                          cmd += "$r/lib/ld-musl-aarch64.so.1"
+                          cmd += "--library-path"
+                          cmd += "$r/usr/lib:$r/lib"
+                          cmd += "$r/usr/bin/proot"
+                          cmd.addAll(extra)
+                          val pb = ProcessBuilder(cmd).directory(ctx.filesDir).redirectErrorStream(true)
+                          pb.environment().apply {
+                              remove("LD_LIBRARY_PATH"); remove("LD_PRELOAD")
+                              put("PROOT_TMP_DIR", e.tmp.path)
+                              put("PROOT_NO_SECCOMP", "1")
+                          }
+                          val pr = pb.start()
+                          val out = pr.inputStream.bufferedReader().readText().trim().lines().filter { it.isNotBlank() }.takeLast(3)
+                          val c = pr.waitFor()
+                          InstallState.add("[diag] " + extra.take(2).joinToString(" ") + " -> codigo " + c)
+                          out.forEach { InstallState.add("[diag] " + it.take(110)) }
+                      }
+                      probe("--version")
+                      probe("-v", "1", "-0", "--link2symlink", "-r", r, "-w", "/", "/bin/sh", "-c", "echo ok")
+                  } catch (t: Throwable) {
+                      InstallState.add("[diag] erro: " + t.message)
+                  }
+              }
+
               suspend fun run(ctx: Context) {
                   val st = InstallState
                   st.phase.value = InstallState.Phase.RUNNING
@@ -623,7 +654,12 @@ jobs:
                       st.step.value = 1
                       withContext(Dispatchers.IO) { prepareFake(ctx) }
                       st.step.value = 2
-                      sh(ctx, SCRIPT_APK)
+                      try {
+                          sh(ctx, SCRIPT_APK)
+                      } catch (t: IOException) {
+                          withContext(Dispatchers.IO) { diag(ctx) }
+                          throw t
+                      }
                       st.step.value = 3
                       sh(ctx, SCRIPT_NPM)
                       st.step.value = 4
