@@ -75,13 +75,24 @@ jobs:
           echo "minirootfs: $FILE"
           curl -fsSL -o dl/mini.tgz "$B/releases/aarch64/$FILE"
           sudo tar -xzf dl/mini.tgz -C rootfs
-          for PKG in proot talloc; do
-            URL=""
-            for REPO in main community; do
-              NAME=$(curl -fsSL "$B/$REPO/aarch64/" | grep -o "href=\"$PKG-[0-9][^\"]*\.apk\"" | sed 's/href="//;s/"//' | sort -V | tail -1 || true)
-              if [ -n "$NAME" ]; then URL="$B/$REPO/aarch64/$NAME"; break; fi
+          # proot nao existe no Alpine v3.22 (so entrou no "community" nas versoes novas),
+          # entao procuramos em varias branches e baixamos proot + talloc da MESMA branch.
+          find_pkg() { # $1=pacote  $2=branch  -> imprime a URL do .apk
+            local R N
+            for R in main community; do
+              N=$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/$2/$R/aarch64/" | grep -o "href=\"$1-[0-9][^\"]*\.apk\"" | sed 's/href="//;s/"//' | sort -V | tail -1 || true)
+              if [ -n "$N" ]; then echo "https://dl-cdn.alpinelinux.org/alpine/$2/$R/aarch64/$N"; return 0; fi
             done
-            [ -n "$URL" ] || { echo "pacote $PKG nao encontrado"; exit 1; }
+            return 1
+          }
+          PB=""
+          for BR in "$ALPINE_BRANCH" v3.23 v3.24 v3.25 edge; do
+            if find_pkg proot "$BR" >/dev/null; then PB="$BR"; break; fi
+          done
+          [ -n "$PB" ] || { echo "proot nao encontrado em nenhuma branch do Alpine"; exit 1; }
+          echo "proot/talloc vindos da branch: $PB"
+          for PKG in proot talloc; do
+            URL=$(find_pkg "$PKG" "$PB") || { echo "pacote $PKG nao encontrado em $PB"; exit 1; }
             echo "baixando $URL"
             curl -fsSL -o "dl/$PKG.apk" "$URL"
             sudo tar -xzf "dl/$PKG.apk" -C rootfs --exclude='.PKGINFO' --exclude='.SIGN.*' --exclude='.post-*' --exclude='.pre-*' --exclude='.trigger' 2>/dev/null || true
