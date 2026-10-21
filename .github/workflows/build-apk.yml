@@ -48,10 +48,15 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
       - name: SDK Android
-        run: yes | sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null || true
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SM="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
+          [ -n "$SM" ] || SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SM"
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" "platforms;android-34" "build-tools;34.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
