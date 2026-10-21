@@ -70,7 +70,7 @@ jobs:
           set -euo pipefail
           B="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}"
           mkdir -p dl rootfs android/app/src/main/assets
-          FILE=$(curl -fsSL "$B/releases/aarch64/latest-releases.yaml" | grep -o 'alpine-minirootfs-[0-9.]*-aarch64\.tar\.gz' | sort -u | head -1)
+          FILE=$(curl -fsSL "$B/releases/aarch64/latest-releases.yaml" | grep -o 'alpine-minirootfs-[0-9.]*-aarch64\.tar\.gz' | sort -uV | tail -1 || true)
           [ -n "$FILE" ] || { echo "minirootfs nao encontrado"; exit 1; }
           echo "minirootfs: $FILE"
           curl -fsSL -o dl/mini.tgz "$B/releases/aarch64/$FILE"
@@ -90,7 +90,7 @@ jobs:
           ls rootfs/usr/lib/libtalloc.so.2*
           test -e rootfs/lib/ld-musl-aarch64.so.1
           sudo tar --numeric-owner -czf android/app/src/main/assets/rootfs.tar.gz -C rootfs .
-          sudo chown "$USER" android/app/src/main/assets/rootfs.tar.gz
+          sudo chown "$(id -u):$(id -g)" android/app/src/main/assets/rootfs.tar.gz
           ls -lh android/app/src/main/assets/rootfs.tar.gz
 
       # ------------------------------------------------------------
@@ -761,7 +761,6 @@ jobs:
           import kotlinx.coroutines.CancellationException
           import kotlinx.coroutines.Job
           import kotlinx.coroutines.flow.Flow
-          import kotlinx.coroutines.flow.collect
           import kotlinx.coroutines.flow.transform
           import kotlinx.coroutines.launch
           import org.json.JSONArray
@@ -930,6 +929,7 @@ jobs:
           import android.app.Activity
           import androidx.activity.compose.BackHandler
           import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.animateFloat
           import androidx.compose.animation.core.infiniteRepeatable
           import androidx.compose.animation.core.rememberInfiniteTransition
           import androidx.compose.animation.core.tween
@@ -1612,6 +1612,8 @@ jobs:
             keytool -genkeypair -keystore "$KEYSTORE_PATH" -storetype PKCS12 \
               -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" \
               -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Claude Code Mobile, O=Local"
+            # PKCS12 so aceita senha da chave = senha do keystore; o Gradle precisa saber disso
+            echo "KEY_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
             echo "Keystore temporaria gerada (adicione os secrets para manter a mesma assinatura)"
           fi
 
@@ -1623,9 +1625,10 @@ jobs:
           set -euo pipefail
           APK=android/app/build/outputs/apk/release/app-release.apk
           test -f "$APK"
-          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
-          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --verbose "$APK"
-          unzip -l "$APK" | grep -q 'assets/rootfs.tar.gz'
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          "$SDK/build-tools/34.0.0/apksigner" verify --verbose "$APK"
+          unzip -l "$APK" > apk-list.txt
+          grep -q 'assets/rootfs.tar.gz' apk-list.txt
           mkdir -p out
           cp "$APK" out/ClaudeCodeMobile.apk
           ls -lh out/
