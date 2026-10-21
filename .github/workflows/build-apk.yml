@@ -100,9 +100,9 @@ jobs:
           test -f rootfs/usr/bin/proot
           ls rootfs/usr/lib/libtalloc.so.2*
           test -e rootfs/lib/ld-musl-aarch64.so.1
-          sudo tar --numeric-owner -czf android/app/src/main/assets/rootfs.tar.gz -C rootfs .
-          sudo chown "$(id -u):$(id -g)" android/app/src/main/assets/rootfs.tar.gz
-          ls -lh android/app/src/main/assets/rootfs.tar.gz
+          sudo tar --numeric-owner -czf android/app/src/main/assets/rootfs.bin -C rootfs .
+          sudo chown "$(id -u):$(id -g)" android/app/src/main/assets/rootfs.bin
+          ls -lh android/app/src/main/assets/rootfs.bin
 
       # ------------------------------------------------------------
       # 2) Projeto Gradle
@@ -406,7 +406,14 @@ jobs:
               }
           }
 
-          // Extrai o rootfs.tar.gz (assets) preservando links simbolicos e permissoes.
+          // Extrai o rootfs.bin (tar.gz em assets) preservando links simbolicos e permissoes.
+          fun openRootfs(ctx: Context): java.io.InputStream = try {
+              ctx.assets.open("rootfs.bin")
+          } catch (e: IOException) {
+              val have = try { ctx.assets.list("")?.joinToString() ?: "?" } catch (_: Exception) { "?" }
+              throw IOException("rootfs.bin ausente no APK. Assets presentes: [$have]")
+          }
+
           @Suppress("DEPRECATION")
           fun extractRootfs(ctx: Context) {
               val e = Env(ctx)
@@ -414,7 +421,7 @@ jobs:
               e.root.mkdirs(); e.tmp.mkdirs()
               val base = e.root.toPath().normalize()
               var n = 0
-              ctx.assets.open("rootfs.tar.gz").use { raw ->
+              openRootfs(ctx).use { raw ->
                   TarArchiveInputStream(GZIPInputStream(raw.buffered(65536))).use { tar ->
                       while (true) {
                           val en = tar.nextTarEntry ?: break
@@ -1071,15 +1078,17 @@ jobs:
                   val ph = InstallState.phase.value
                   if (!ready && ph != InstallState.Phase.RUNNING && ph != InstallState.Phase.ERROR) startInstall(ctx)
               }
-              Box(
-                  Modifier.fillMaxSize()
-                      .background(MaterialTheme.colorScheme.background)
-                      .systemBarsPadding()
-              ) {
-                  when {
-                      screen == "settings" -> SettingsScreen(onBack = { screen = "main" })
-                      !ready -> SetupScreen(onSettings = { screen = "settings" })
-                      else -> ChatScreen(vm, onSettings = { screen = "settings" })
+              CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onBackground) {
+                  Box(
+                      Modifier.fillMaxSize()
+                          .background(MaterialTheme.colorScheme.background)
+                          .systemBarsPadding()
+                  ) {
+                      when {
+                          screen == "settings" -> SettingsScreen(onBack = { screen = "main" })
+                          !ready -> SetupScreen(onSettings = { screen = "settings" })
+                          else -> ChatScreen(vm, onSettings = { screen = "settings" })
+                      }
                   }
               }
           }
@@ -1100,7 +1109,7 @@ jobs:
                   Spacer(Modifier.height(32.dp))
                   Spark(64.dp, spin = phase == InstallState.Phase.RUNNING)
                   Spacer(Modifier.height(20.dp))
-                  Text("Preparando o Claude Code", fontFamily = FontFamily.Serif, fontSize = 28.sp, textAlign = TextAlign.Center)
+                  Text("Preparando o Claude Code", fontFamily = FontFamily.Serif, fontSize = 28.sp, lineHeight = 34.sp, textAlign = TextAlign.Center)
                   Spacer(Modifier.height(8.dp))
                   Text(
                       "Instalando em segundo plano. Pode fechar o app: a instalação continua.",
