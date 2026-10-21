@@ -1,0 +1,1632 @@
+# =====================================================================
+#  Claude Code Mobile — gera o projeto Android e compila o APK assinado
+#  Salve como:  .github/workflows/build-apk.yml   (repo no GitHub)
+#  Rode em:     Actions > "Build Claude Code Mobile" > Run workflow
+#
+#  O que o APK faz:
+#   - embute um mini Linux (Alpine arm64 + proot) dentro do app
+#   - em segundo plano (serviço em foreground) instala Node, git, ripgrep
+#     e o @anthropic-ai/claude-code
+#   - interface de chat no estilo do app Claude (claro/escuro, serifa,
+#     terracota), usando o Claude Code em modo headless (stream-json)
+#   - Ajustes: Gateway (URL base, token Bearer / API key / OAuth token,
+#     modelo, cabeçalhos, variáveis extras), modo de permissões e teste
+#
+#  (Opcional) Secrets p/ manter a mesma assinatura entre builds e poder
+#  atualizar o app sem desinstalar: KEYSTORE_BASE64, KEYSTORE_PASSWORD,
+#  KEY_ALIAS, KEY_PASSWORD
+# =====================================================================
+name: Build Claude Code Mobile
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ALPINE_BRANCH: v3.22
+  KEYSTORE_PATH: ${{ github.workspace }}/android/app/release.jks
+  KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
+  KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
+  KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
+  VERSION_CODE: ${{ github.run_number }}
+  VERSION_NAME: 1.0.${{ github.run_number }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: SDK Android
+        run: yes | sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      # ------------------------------------------------------------
+      # 1) Linux embutido: Alpine minirootfs (arm64) + proot + talloc
+      # ------------------------------------------------------------
+      - name: Montar rootfs (Alpine + proot)
+        run: |
+          set -euo pipefail
+          B="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}"
+          mkdir -p dl rootfs android/app/src/main/assets
+          FILE=$(curl -fsSL "$B/releases/aarch64/latest-releases.yaml" | grep -o 'alpine-minirootfs-[0-9.]*-aarch64\.tar\.gz' | sort -u | head -1)
+          [ -n "$FILE" ] || { echo "minirootfs nao encontrado"; exit 1; }
+          echo "minirootfs: $FILE"
+          curl -fsSL -o dl/mini.tgz "$B/releases/aarch64/$FILE"
+          sudo tar -xzf dl/mini.tgz -C rootfs
+          for PKG in proot talloc; do
+            URL=""
+            for REPO in main community; do
+              NAME=$(curl -fsSL "$B/$REPO/aarch64/" | grep -o "href=\"$PKG-[0-9][^\"]*\.apk\"" | sed 's/href="//;s/"//' | sort -V | tail -1 || true)
+              if [ -n "$NAME" ]; then URL="$B/$REPO/aarch64/$NAME"; break; fi
+            done
+            [ -n "$URL" ] || { echo "pacote $PKG nao encontrado"; exit 1; }
+            echo "baixando $URL"
+            curl -fsSL -o "dl/$PKG.apk" "$URL"
+            sudo tar -xzf "dl/$PKG.apk" -C rootfs --exclude='.PKGINFO' --exclude='.SIGN.*' --exclude='.post-*' --exclude='.pre-*' --exclude='.trigger' 2>/dev/null || true
+          done
+          test -f rootfs/usr/bin/proot
+          ls rootfs/usr/lib/libtalloc.so.2*
+          test -e rootfs/lib/ld-musl-aarch64.so.1
+          sudo tar --numeric-owner -czf android/app/src/main/assets/rootfs.tar.gz -C rootfs .
+          sudo chown "$USER" android/app/src/main/assets/rootfs.tar.gz
+          ls -lh android/app/src/main/assets/rootfs.tar.gz
+
+      # ------------------------------------------------------------
+      # 2) Projeto Gradle
+      # ------------------------------------------------------------
+      - name: Gradle (arquivos de build)
+        run: |
+          set -euo pipefail
+          cd android
+          mkdir -p app/src/main/java/com/ccmobile/app app/src/main/res/{values,values-night,drawable,mipmap-anydpi-v26}
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ClaudeCodeMobile"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.ccmobile.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.ccmobile.app"
+                  minSdk = 26
+                  // targetSdk 28: necessario para o Android permitir executar
+                  // binarios (proot/musl) extraidos para o armazenamento do app
+                  // (mesma estrategia do Termux).
+                  targetSdk = 28
+                  versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
+                  versionName = System.getenv("VERSION_NAME") ?: "1.0.0"
+              }
+
+              signingConfigs {
+                  create("release") {
+                      storeFile = file(System.getenv("KEYSTORE_PATH") ?: "release.jks")
+                      storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
+                      keyAlias = System.getenv("KEY_ALIAS") ?: "release"
+                      keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+                  disable += "ExpiredTargetSdkVersion"
+              }
+              packaging {
+                  resources {
+                      excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/INDEX.LIST")
+                  }
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-core")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+              implementation("org.apache.commons:commons-compress:1.26.2")
+          }
+          EOF
+
+      - name: Manifest e recursos
+        run: |
+          set -euo pipefail
+          cd android/app/src/main
+
+          cat > AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Claude Code Mobile"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density|locale|layoutDirection">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service android:name=".BgService" android:exported="false" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > res/values/themes.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">@android:color/transparent</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > res/values/colors.xml <<'EOF'
+          <resources>
+              <color name="bg">#FAF9F5</color>
+              <color name="brand">#D97757</color>
+          </resources>
+          EOF
+
+          cat > res/values-night/colors.xml <<'EOF'
+          <resources>
+              <color name="bg">#262624</color>
+          </resources>
+          EOF
+
+          cat > res/drawable/ic_launcher_fg.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:strokeColor="#FAF9F5" android:strokeWidth="6" android:strokeLineCap="round" android:pathData="M54,29 L54,79" />
+              <path android:strokeColor="#FAF9F5" android:strokeWidth="6" android:strokeLineCap="round" android:pathData="M29,54 L79,54" />
+              <path android:strokeColor="#FAF9F5" android:strokeWidth="6" android:strokeLineCap="round" android:pathData="M36,36 L72,72" />
+              <path android:strokeColor="#FAF9F5" android:strokeWidth="6" android:strokeLineCap="round" android:pathData="M72,36 L36,72" />
+          </vector>
+          EOF
+
+          cat > res/drawable/ic_stat.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="2" android:strokeLineCap="round" android:pathData="M12,3 L12,21" />
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="2" android:strokeLineCap="round" android:pathData="M3,12 L21,12" />
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="2" android:strokeLineCap="round" android:pathData="M5.6,5.6 L18.4,18.4" />
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="2" android:strokeLineCap="round" android:pathData="M18.4,5.6 L5.6,18.4" />
+          </vector>
+          EOF
+
+          cat > res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/brand" />
+              <foreground android:drawable="@drawable/ic_launcher_fg" />
+          </adaptive-icon>
+          EOF
+
+      # ------------------------------------------------------------
+      # 3) Código Kotlin: núcleo (proot, instalação, ajustes)
+      # ------------------------------------------------------------
+      - name: Kotlin — Core.kt
+        run: |
+          set -euo pipefail
+          cat > android/app/src/main/java/com/ccmobile/app/Core.kt <<'EOF'
+          package com.ccmobile.app
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.os.Build
+          import android.system.Os
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.channels.Channel
+          import kotlinx.coroutines.channels.awaitClose
+          import kotlinx.coroutines.flow.*
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+          import java.io.File
+          import java.io.IOException
+          import java.nio.file.Files
+          import java.nio.file.LinkOption
+          import java.util.zip.GZIPInputStream
+          import kotlin.properties.ReadWriteProperty
+          import kotlin.reflect.KProperty
+
+          // ---------------------------------------------------------------- Ajustes
+          class Prefs(ctx: Context) {
+              private val sp: SharedPreferences = try {
+                  val mk = MasterKey.Builder(ctx).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
+                  EncryptedSharedPreferences.create(
+                      ctx, "secure_prefs", mk,
+                      EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                      EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                  )
+              } catch (t: Throwable) {
+                  ctx.getSharedPreferences("prefs_fallback", Context.MODE_PRIVATE)
+              }
+
+              private inner class S(val k: String, val d: String = "") : ReadWriteProperty<Any?, String> {
+                  override fun getValue(thisRef: Any?, property: KProperty<*>): String = sp.getString(k, d) ?: d
+                  override fun setValue(thisRef: Any?, property: KProperty<*>, value: String) {
+                      sp.edit().putString(k, value).apply()
+                  }
+              }
+
+              var baseUrl by S("baseUrl")
+              var authMode by S("authMode", "bearer")   // bearer | apikey | oauth
+              var token by S("token")
+              var model by S("model")
+              var headers by S("headers")
+              var extraEnv by S("extraEnv")
+              var permMode by S("permMode", "acceptEdits") // acceptEdits | plan | bypass
+
+              fun claudeEnv(): Map<String, String> {
+                  val m = LinkedHashMap<String, String>()
+                  if (baseUrl.isNotBlank()) m["ANTHROPIC_BASE_URL"] = baseUrl.trim()
+                  if (token.isNotBlank()) {
+                      when (authMode) {
+                          "apikey" -> m["ANTHROPIC_API_KEY"] = token.trim()
+                          "oauth" -> m["CLAUDE_CODE_OAUTH_TOKEN"] = token.trim()
+                          else -> m["ANTHROPIC_AUTH_TOKEN"] = token.trim()
+                      }
+                  }
+                  if (model.isNotBlank()) m["ANTHROPIC_MODEL"] = model.trim()
+                  if (headers.isNotBlank()) m["ANTHROPIC_CUSTOM_HEADERS"] = headers.trim()
+                  val ok = Regex("[A-Za-z_][A-Za-z0-9_]*")
+                  extraEnv.lines().forEach { l ->
+                      val i = l.indexOf('=')
+                      if (i > 0) {
+                          val k = l.substring(0, i).trim()
+                          if (ok.matches(k)) m[k] = l.substring(i + 1).trim()
+                      }
+                  }
+                  return m
+              }
+          }
+
+          // ---------------------------------------------------------------- Caminhos
+          class Env(ctx: Context) {
+              val root = File(ctx.filesDir, "rootfs")
+              val tmp = File(ctx.filesDir, "tmp")
+              val fake = File(ctx.filesDir, "fake")
+              val rootOk = File(ctx.filesDir, "rootfs.ok")
+              val okFile = File(ctx.filesDir, "install.ok")
+              val installed: Boolean get() = okFile.exists()
+          }
+
+          fun rmrf(f: File) {
+              try {
+                  val p = f.toPath()
+                  if (!Files.exists(p, LinkOption.NOFOLLOW_LINKS)) return
+                  if (!Files.isSymbolicLink(p) && f.isDirectory) f.listFiles()?.forEach { rmrf(it) }
+                  f.delete()
+              } catch (_: Exception) {
+              }
+          }
+
+          // Extrai o rootfs.tar.gz (assets) preservando links simbolicos e permissoes.
+          @Suppress("DEPRECATION")
+          fun extractRootfs(ctx: Context) {
+              val e = Env(ctx)
+              rmrf(e.root); e.rootOk.delete()
+              e.root.mkdirs(); e.tmp.mkdirs()
+              val base = e.root.toPath().normalize()
+              var n = 0
+              ctx.assets.open("rootfs.tar.gz").use { raw ->
+                  TarArchiveInputStream(GZIPInputStream(raw.buffered(65536))).use { tar ->
+                      while (true) {
+                          val en = tar.nextTarEntry ?: break
+                          val name = en.name.removePrefix("./").trimEnd('/')
+                          if (name.isEmpty() || name == ".") continue
+                          val f = File(e.root, name)
+                          if (!f.toPath().normalize().startsWith(base)) continue
+                          f.parentFile?.mkdirs()
+                          if (en.isDirectory) {
+                              if (!f.exists()) f.mkdirs()
+                          } else {
+                              try { Files.deleteIfExists(f.toPath()) } catch (_: Exception) {}
+                              when {
+                                  en.isSymbolicLink -> Os.symlink(en.linkName, f.path)
+                                  en.isLink -> {
+                                      val t = File(e.root, en.linkName.removePrefix("./"))
+                                      try { Os.link(t.path, f.path) } catch (_: Exception) { t.copyTo(f, true) }
+                                  }
+                                  else -> f.outputStream().use { o -> tar.copyTo(o) }
+                              }
+                          }
+                          if (!en.isSymbolicLink) {
+                              try { Os.chmod(f.path, (en.mode and 4095) or (if (en.isDirectory) 448 else 384)) } catch (_: Exception) {}
+                          }
+                          n++
+                          if (n % 400 == 0) InstallState.add("Extraindo sistema… $n arquivos")
+                      }
+                  }
+              }
+              if (!File(e.root, "usr/bin/proot").exists()) throw IOException("proot ausente no pacote do app")
+              File(e.root, "root/workspace").mkdirs()
+              File(e.root, "tmp").mkdirs()
+              try { Os.chmod(File(e.root, "tmp").path, 1023) } catch (_: Exception) {}
+          }
+
+          // Arquivos /proc falsos (o Android bloqueia /proc/stat) + DNS
+          fun prepareFake(ctx: Context) {
+              val e = Env(ctx)
+              e.fake.mkdirs(); e.tmp.mkdirs()
+              val n = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+              val sb = StringBuilder("cpu  1957 0 2877 93280 262 342 254 87 0 0\n")
+              for (i in 0 until n) sb.append("cpu$i 1957 0 2877 93280 262 342 254 87 0 0\n")
+              sb.append("intr 63361 0 0\nctxt 2236400\nbtime 1735689600\nprocesses 1914\nprocs_running 1\nprocs_blocked 0\nsoftirq 1 0 1 0 0 0 0 0 0 0 0\n")
+              File(e.fake, "stat").writeText(sb.toString())
+              File(e.fake, "loadavg").writeText("0.12 0.07 0.02 2/165 765\n")
+              File(e.fake, "uptime").writeText("284684.56 513853.46\n")
+              val etc = File(e.root, "etc")
+              if (etc.isDirectory) {
+                  try { Files.deleteIfExists(File(etc, "resolv.conf").toPath()) } catch (_: Exception) {}
+                  File(etc, "resolv.conf").writeText("nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+                  if (!File(etc, "hosts").exists()) File(etc, "hosts").writeText("127.0.0.1 localhost\n::1 localhost\n")
+              }
+          }
+
+          private fun buildCmd(ctx: Context, inner: String, cwd: String, env: Map<String, String>): List<String> {
+              val e = Env(ctx)
+              val r = e.root.path
+              val l = ArrayList<String>()
+              l += "$r/lib/ld-musl-aarch64.so.1"
+              l += "--library-path"; l += "$r/usr/lib:$r/lib"
+              l += "$r/usr/bin/proot"
+              l += listOf(
+                  "-0", "--link2symlink", "--kill-on-exit", "-r", r,
+                  "-b", "/dev", "-b", "/proc", "-b", "/sys",
+                  "-b", "${e.fake.path}/stat:/proc/stat",
+                  "-b", "${e.fake.path}/loadavg:/proc/loadavg",
+                  "-b", "${e.fake.path}/uptime:/proc/uptime",
+                  "-w", cwd
+              )
+              l += listOf(
+                  "/usr/bin/env", "-i",
+                  "HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/sh", "TERM=dumb",
+                  "LANG=C.UTF-8", "TMPDIR=/tmp",
+                  "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+              )
+              env.forEach { (k, v) -> l += "$k=$v" }
+              l += listOf("/bin/sh", "-c", inner)
+              return l
+          }
+
+          sealed interface Out {
+              data class Line(val s: String) : Out
+              data class Code(val c: Int) : Out
+          }
+
+          // Executa um comando dentro do Linux embutido; emite linhas e, no fim, o codigo de saida.
+          fun execFlow(
+              ctx: Context, inner: String, cwd: String = "/root",
+              env: Map<String, String> = emptyMap(), stdin: String? = null
+          ): Flow<Out> = callbackFlow<Out> {
+              prepareFake(ctx)
+              val e = Env(ctx)
+              if (!File(e.root, "usr/bin/proot").exists()) throw IllegalStateException("Ambiente Linux nao instalado")
+              val pb = ProcessBuilder(buildCmd(ctx, inner, cwd, env))
+                  .directory(ctx.filesDir)
+                  .redirectErrorStream(true)
+              pb.environment().apply {
+                  remove("LD_LIBRARY_PATH"); remove("LD_PRELOAD")
+                  put("PROOT_TMP_DIR", e.tmp.path)
+                  put("PROOT_NO_SECCOMP", "1")
+                  put("TMPDIR", e.tmp.path)
+              }
+              val p = pb.start()
+              val reader = launch(Dispatchers.IO) {
+                  try {
+                      try {
+                          p.outputStream.use { o -> if (stdin != null) o.write(stdin.toByteArray()) }
+                      } catch (_: IOException) {
+                      }
+                      p.inputStream.bufferedReader().forEachLine { trySend(Out.Line(it)) }
+                      send(Out.Code(p.waitFor()))
+                  } catch (t: Throwable) {
+                      if (t !is CancellationException) {
+                          trySend(Out.Line("erro: ${t.message}"))
+                          trySend(Out.Code(-1))
+                      }
+                  } finally {
+                      close()
+                  }
+              }
+              awaitClose {
+                  reader.cancel()
+                  p.destroyForcibly()
+              }
+          }.buffer(Channel.UNLIMITED)
+
+          // ---------------------------------------------------------------- Instalação
+          object InstallState {
+              enum class Phase { IDLE, RUNNING, DONE, ERROR }
+
+              val phase = MutableStateFlow(Phase.IDLE)
+              val step = MutableStateFlow(0)
+              val log = MutableStateFlow<List<String>>(emptyList())
+              val error = MutableStateFlow("")
+              val version = MutableStateFlow("")
+              val ready = MutableStateFlow(false)
+              val steps = listOf(
+                  "Preparando o sistema Linux",
+                  "Configurando rede",
+                  "Instalando Node.js e ferramentas",
+                  "Instalando o Claude Code",
+                  "Verificando a instalação"
+              )
+
+              fun add(line: String) { log.update { (it + line).takeLast(200) } }
+
+              fun init(ctx: Context) {
+                  if (phase.value != Phase.RUNNING) {
+                      val v = Env(ctx).installed
+                      ready.value = v
+                      if (v) version.value = try { Env(ctx).okFile.readText().trim() } catch (_: Exception) { "" }
+                  }
+              }
+          }
+
+          object Installer {
+              private const val SCRIPT_APK = """
+          set -e
+          apk update || (sleep 3 && apk update) || (sleep 6 && apk update)
+          apk add --no-cache nodejs npm git bash curl ripgrep libgcc libstdc++ ca-certificates openssh-client
+          mkdir -p /root/workspace /tmp
+          chmod 1777 /tmp
+          """
+              private const val SCRIPT_NPM = """
+          set -e
+          npm config set update-notifier false
+          npm install -g --no-fund --no-audit @anthropic-ai/claude-code || (sleep 4 && npm install -g --no-fund --no-audit @anthropic-ai/claude-code)
+          """
+
+              private suspend fun sh(ctx: Context, script: String): String {
+                  var last = ""
+                  var code = -1
+                  execFlow(ctx, script).collect { o ->
+                      if (o is Out.Line) {
+                          if (o.s.isNotBlank()) last = o.s
+                          InstallState.add(o.s)
+                      } else if (o is Out.Code) {
+                          code = o.c
+                      }
+                  }
+                  if (code != 0) throw IOException("Falha (código $code): $last")
+                  return last
+              }
+
+              suspend fun run(ctx: Context) {
+                  val st = InstallState
+                  st.phase.value = InstallState.Phase.RUNNING
+                  st.error.value = ""
+                  st.log.value = emptyList()
+                  st.step.value = 0
+                  try {
+                      if (!Build.SUPPORTED_ABIS.contains("arm64-v8a"))
+                          throw IllegalStateException("Este app precisa de um aparelho ARM64 (arm64-v8a).")
+                      val e = Env(ctx)
+                      if (!e.rootOk.exists() || !File(e.root, "usr/bin/proot").exists()) {
+                          withContext(Dispatchers.IO) { extractRootfs(ctx) }
+                          e.rootOk.writeText("1")
+                      }
+                      st.step.value = 1
+                      withContext(Dispatchers.IO) { prepareFake(ctx) }
+                      st.step.value = 2
+                      sh(ctx, SCRIPT_APK)
+                      st.step.value = 3
+                      sh(ctx, SCRIPT_NPM)
+                      st.step.value = 4
+                      val ver = sh(ctx, "claude --version")
+                      e.okFile.writeText(ver)
+                      st.version.value = ver
+                      st.step.value = InstallState.steps.size
+                      st.ready.value = true
+                      st.phase.value = InstallState.Phase.DONE
+                  } catch (c: CancellationException) {
+                      st.phase.value = InstallState.Phase.IDLE
+                      throw c
+                  } catch (t: Throwable) {
+                      st.error.value = t.message ?: t.javaClass.simpleName
+                      st.phase.value = InstallState.Phase.ERROR
+                  }
+              }
+          }
+          EOF
+
+      - name: Kotlin — Service.kt e MainActivity.kt
+        run: |
+          set -euo pipefail
+          D=android/app/src/main/java/com/ccmobile/app
+
+          cat > $D/Service.kt <<'EOF'
+          package com.ccmobile.app
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.os.IBinder
+          import android.os.PowerManager
+          import kotlinx.coroutines.*
+          import java.util.concurrent.atomic.AtomicInteger
+
+          class BgService : Service() {
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+              private var wl: PowerManager.WakeLock? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel("bg", "Execução em segundo plano", NotificationManager.IMPORTANCE_LOW)
+                  )
+              }
+
+              private fun notif(text: String): Notification {
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return Notification.Builder(this, "bg")
+                      .setSmallIcon(R.drawable.ic_stat)
+                      .setContentTitle("Claude Code Mobile")
+                      .setContentText(text)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startForeground(1, notif(intent?.getStringExtra("text") ?: "Em execução…"))
+                  if (wl == null) {
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ccmobile:bg").apply {
+                          acquire(6 * 60 * 60 * 1000L)
+                      }
+                  }
+                  if (intent?.action == ACTION_INSTALL) {
+                      scope.launch {
+                          try {
+                              Installer.run(applicationContext)
+                          } finally {
+                              installing = false
+                              release(applicationContext)
+                          }
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  scope.cancel()
+                  try { if (wl?.isHeld == true) wl?.release() } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_INSTALL = "com.ccmobile.app.INSTALL"
+                  private val holds = AtomicInteger(0)
+                  @Volatile var installing = false
+
+                  fun hold(ctx: Context, text: String, action: String? = null) {
+                      holds.incrementAndGet()
+                      val i = Intent(ctx, BgService::class.java).putExtra("text", text)
+                      if (action != null) i.action = action
+                      ctx.startForegroundService(i)
+                  }
+
+                  fun release(ctx: Context) {
+                      if (holds.decrementAndGet() <= 0) {
+                          holds.set(0)
+                          ctx.stopService(Intent(ctx, BgService::class.java))
+                      }
+                  }
+              }
+          }
+
+          fun startInstall(ctx: Context) {
+              if (BgService.installing) return
+              BgService.installing = true
+              BgService.hold(ctx, "Instalando o Claude Code…", BgService.ACTION_INSTALL)
+          }
+          EOF
+
+          cat > $D/MainActivity.kt <<'EOF'
+          package com.ccmobile.app
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.core.view.WindowCompat
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  WindowCompat.setDecorFitsSystemWindows(window, false)
+                  InstallState.init(this)
+                  setContent { AppTheme { Root() } }
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------
+      # 4) Claude Code headless + ViewModel
+      # ------------------------------------------------------------
+      - name: Kotlin — Chat.kt
+        run: |
+          set -euo pipefail
+          cat > android/app/src/main/java/com/ccmobile/app/Chat.kt <<'EOF'
+          package com.ccmobile.app
+
+          import android.app.Application
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.collect
+          import kotlinx.coroutines.flow.transform
+          import kotlinx.coroutines.launch
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          sealed interface Item { val id: Long }
+          data class UserMsg(override val id: Long, val text: String) : Item
+          data class AsstMsg(override val id: Long, val text: String) : Item
+          data class ToolMsg(override val id: Long, val name: String, val detail: String) : Item
+          data class ErrMsg(override val id: Long, val text: String) : Item
+
+          sealed interface Ev {
+              data class Init(val session: String) : Ev
+              data class Text(val t: String) : Ev
+              data class Tool(val name: String, val detail: String) : Ev
+              data class Result(val error: Boolean, val text: String, val session: String) : Ev
+              data class Raw(val line: String) : Ev
+              data class Exit(val code: Int) : Ev
+          }
+
+          object Claude {
+              fun stream(ctx: android.content.Context, prompt: String, session: String?): Flow<Ev> {
+                  val p = Prefs(ctx)
+                  val perm = when (p.permMode) {
+                      "plan" -> "--permission-mode plan"
+                      "bypass" -> "--dangerously-skip-permissions"
+                      else -> "--permission-mode acceptEdits --allowedTools 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch'"
+                  }
+                  val resume = session
+                      ?.takeIf { Regex("[A-Za-z0-9-]{8,64}").matches(it) }
+                      ?.let { " --resume $it" } ?: ""
+                  val inner = "mkdir -p /root/workspace && cd /root/workspace && exec claude -p --output-format stream-json --verbose $perm$resume"
+                  val env = mapOf(
+                      "IS_SANDBOX" to "1",
+                      "DISABLE_AUTOUPDATER" to "1",
+                      "USE_BUILTIN_RIPGREP" to "0",
+                      "NO_COLOR" to "1"
+                  ) + p.claudeEnv()
+                  return execFlow(ctx, inner, "/root", env, prompt).transform { o ->
+                      for (e in parse(o)) emit(e)
+                  }
+              }
+
+              private fun detail(i: JSONObject?): String {
+                  if (i == null) return ""
+                  for (k in listOf("command", "file_path", "pattern", "url", "query", "path", "description", "prompt")) {
+                      val v = i.optString(k)
+                      if (v.isNotBlank()) return v.replace("\n", " ").take(140)
+                  }
+                  return ""
+              }
+
+              private fun parse(o: Out): List<Ev> {
+                  if (o is Out.Code) return listOf(Ev.Exit(o.c))
+                  val line = (o as Out.Line).s.trim()
+                  if (line.isEmpty()) return emptyList()
+                  if (!line.startsWith("{")) return listOf(Ev.Raw(line))
+                  val j = try { JSONObject(line) } catch (_: Exception) { return listOf(Ev.Raw(line)) }
+                  return when (j.optString("type")) {
+                      "system" ->
+                          if (j.optString("subtype") == "init") listOf(Ev.Init(j.optString("session_id"))) else emptyList()
+                      "assistant" -> {
+                          val arr: JSONArray = j.optJSONObject("message")?.optJSONArray("content") ?: return emptyList()
+                          val out = ArrayList<Ev>()
+                          for (i in 0 until arr.length()) {
+                              val b = arr.optJSONObject(i) ?: continue
+                              when (b.optString("type")) {
+                                  "text" -> { val t = b.optString("text"); if (t.isNotBlank()) out.add(Ev.Text(t)) }
+                                  "tool_use" -> out.add(Ev.Tool(b.optString("name"), detail(b.optJSONObject("input"))))
+                              }
+                          }
+                          out
+                      }
+                      "result" -> listOf(Ev.Result(j.optBoolean("is_error"), j.optString("result"), j.optString("session_id")))
+                      else -> emptyList()
+                  }
+              }
+          }
+
+          class ChatVM(app: Application) : AndroidViewModel(app) {
+              val items = mutableStateListOf<Item>()
+              var running by mutableStateOf(false)
+                  private set
+
+              private var session: String? = null
+              private var job: Job? = null
+              private var seq = 0L
+              private var gotText = false
+              private var failed = false
+              private val raw = ArrayList<String>()
+
+              private fun nid() = seq++
+
+              private fun hint(t: String): String {
+                  val l = t.lowercase()
+                  return if (l.contains("login") || l.contains("api key") || l.contains("401") || l.contains("authent"))
+                      "\n\nConfigure a chave ou o Gateway em Ajustes (engrenagem)." else ""
+              }
+
+              private fun handle(ev: Ev) {
+                  when (ev) {
+                      is Ev.Init -> { if (ev.session.isNotBlank()) session = ev.session }
+                      is Ev.Text -> { gotText = true; items.add(AsstMsg(nid(), ev.t)) }
+                      is Ev.Tool -> { items.add(ToolMsg(nid(), ev.name, ev.detail)) }
+                      is Ev.Result -> {
+                          if (ev.session.isNotBlank()) session = ev.session
+                          if (ev.error) {
+                              failed = true
+                              items.add(ErrMsg(nid(), ev.text.ifBlank { "Erro desconhecido" } + hint(ev.text)))
+                          } else if (!gotText && ev.text.isNotBlank()) {
+                              items.add(AsstMsg(nid(), ev.text))
+                          }
+                      }
+                      is Ev.Raw -> { raw.add(ev.line); if (raw.size > 25) raw.removeAt(0) }
+                      is Ev.Exit -> {
+                          if (ev.code != 0 && !failed) {
+                              val extra = raw.takeLast(8).joinToString("\n")
+                              items.add(ErrMsg(nid(), "O Claude Code encerrou com código ${ev.code}.\n$extra" + hint(extra)))
+                          }
+                      }
+                  }
+              }
+
+              fun send(text: String) {
+                  val t = text.trim()
+                  if (t.isEmpty() || running) return
+                  val ctx = getApplication<Application>()
+                  items.add(UserMsg(nid(), t))
+                  running = true; gotText = false; failed = false; raw.clear()
+                  BgService.hold(ctx, "Claude está trabalhando…")
+                  job = viewModelScope.launch {
+                      try {
+                          Claude.stream(ctx, t, session).collect { ev -> handle(ev) }
+                      } catch (c: CancellationException) {
+                          throw c
+                      } catch (e: Throwable) {
+                          items.add(ErrMsg(nid(), e.message ?: e.javaClass.simpleName))
+                      } finally {
+                          running = false
+                          BgService.release(ctx)
+                      }
+                  }
+              }
+
+              fun stop() { job?.cancel() }
+
+              fun newChat() {
+                  job?.cancel()
+                  items.clear()
+                  session = null
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------
+      # 5) UI (estilo app Claude: creme/terracota, serifa, claro/escuro)
+      # ------------------------------------------------------------
+      - name: Kotlin — UI.kt
+        run: |
+          set -euo pipefail
+          cat > android/app/src/main/java/com/ccmobile/app/UI.kt <<'EOF'
+          @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
+          package com.ccmobile.app
+
+          import android.app.Activity
+          import androidx.activity.compose.BackHandler
+          import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.BorderStroke
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.rememberLazyListState
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.CheckCircle
+          import androidx.compose.material.icons.filled.Edit
+          import androidx.compose.material.icons.filled.Settings
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.rotate
+          import androidx.compose.ui.geometry.CornerRadius
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.graphics.StrokeCap
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalView
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.buildAnnotatedString
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.text.input.VisualTransformation
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.text.withStyle
+          import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.view.WindowCompat
+          import androidx.lifecycle.viewmodel.compose.viewModel
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          object C { val brand = Color(0xFFD97757) }
+
+          // ------------------------------------------------------------ Tema
+          @Composable
+          fun AppTheme(content: @Composable () -> Unit) {
+              val dark = isSystemInDarkTheme()
+              val cs = if (dark) darkColorScheme(
+                  primary = C.brand, onPrimary = Color.White,
+                  background = Color(0xFF262624), onBackground = Color(0xFFFAF9F5),
+                  surface = Color(0xFF30302E), onSurface = Color(0xFFFAF9F5),
+                  surfaceVariant = Color(0xFF3A3935), onSurfaceVariant = Color(0xFFC2C0B6),
+                  outline = Color(0xFF4A4945), error = Color(0xFFEF6B5F)
+              ) else lightColorScheme(
+                  primary = C.brand, onPrimary = Color.White,
+                  background = Color(0xFFFAF9F5), onBackground = Color(0xFF141413),
+                  surface = Color.White, onSurface = Color(0xFF141413),
+                  surfaceVariant = Color(0xFFF0EEE6), onSurfaceVariant = Color(0xFF6B6A64),
+                  outline = Color(0xFFE3E0D5), error = Color(0xFFB3261E)
+              )
+              val view = LocalView.current
+              SideEffect {
+                  val w = (view.context as? Activity)?.window
+                  if (w != null) {
+                      val c = WindowCompat.getInsetsController(w, view)
+                      c.isAppearanceLightStatusBars = !dark
+                      c.isAppearanceLightNavigationBars = !dark
+                  }
+              }
+              MaterialTheme(colorScheme = cs, typography = Typography(), content = content)
+          }
+
+          @Composable
+          fun Spark(dp: Dp, color: Color = C.brand, spin: Boolean = false) {
+              val rot = if (spin) {
+                  val t = rememberInfiniteTransition(label = "spin")
+                  t.animateFloat(0f, 360f, infiniteRepeatable(tween(6000, easing = LinearEasing)), label = "rot").value
+              } else 0f
+              Canvas(Modifier.size(dp).rotate(rot)) {
+                  val r = this.size.minDimension / 2f
+                  for (i in 0 until 12) {
+                      val a = Math.toRadians(i * 30.0 + (i % 3) * 5.0).toFloat()
+                      val len = if (i % 2 == 0) r else r * 0.74f
+                      val s = r * 0.14f
+                      drawLine(
+                          color,
+                          Offset(center.x + cos(a) * s, center.y + sin(a) * s),
+                          Offset(center.x + cos(a) * len, center.y + sin(a) * len),
+                          strokeWidth = r * 0.17f, cap = StrokeCap.Round
+                      )
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------ Raiz
+          @Composable
+          fun Root() {
+              val ctx = LocalContext.current
+              val ready by InstallState.ready.collectAsState()
+              var screen by remember { mutableStateOf("main") }
+              val vm: ChatVM = viewModel()
+              BackHandler(enabled = screen == "settings") { screen = "main" }
+              LaunchedEffect(ready) {
+                  val ph = InstallState.phase.value
+                  if (!ready && ph != InstallState.Phase.RUNNING && ph != InstallState.Phase.ERROR) startInstall(ctx)
+              }
+              Box(
+                  Modifier.fillMaxSize()
+                      .background(MaterialTheme.colorScheme.background)
+                      .systemBarsPadding()
+              ) {
+                  when {
+                      screen == "settings" -> SettingsScreen(onBack = { screen = "main" })
+                      !ready -> SetupScreen(onSettings = { screen = "settings" })
+                      else -> ChatScreen(vm, onSettings = { screen = "settings" })
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------ Instalação
+          @Composable
+          fun SetupScreen(onSettings: () -> Unit) {
+              val ctx = LocalContext.current
+              val cs = MaterialTheme.colorScheme
+              val phase by InstallState.phase.collectAsState()
+              val step by InstallState.step.collectAsState()
+              val log by InstallState.log.collectAsState()
+              val err by InstallState.error.collectAsState()
+              Column(
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Spacer(Modifier.height(32.dp))
+                  Spark(64.dp, spin = phase == InstallState.Phase.RUNNING)
+                  Spacer(Modifier.height(20.dp))
+                  Text("Preparando o Claude Code", fontFamily = FontFamily.Serif, fontSize = 28.sp, textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(8.dp))
+                  Text(
+                      "Instalando em segundo plano. Pode fechar o app: a instalação continua.",
+                      color = cs.onSurfaceVariant, textAlign = TextAlign.Center
+                  )
+                  Spacer(Modifier.height(24.dp))
+                  LinearProgressIndicator(
+                      progress = { step / InstallState.steps.size.toFloat() },
+                      modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape),
+                      color = C.brand, trackColor = cs.surfaceVariant
+                  )
+                  Spacer(Modifier.height(16.dp))
+                  InstallState.steps.forEachIndexed { i, label ->
+                      Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                          Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
+                              if (i < step) {
+                                  Icon(Icons.Default.CheckCircle, null, tint = C.brand)
+                              } else if (i == step && phase == InstallState.Phase.RUNNING) {
+                                  CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = C.brand)
+                              } else {
+                                  Box(Modifier.size(16.dp).border(1.5.dp, cs.outline, CircleShape))
+                              }
+                          }
+                          Spacer(Modifier.width(12.dp))
+                          Text(label, color = if (i <= step) cs.onBackground else cs.onSurfaceVariant)
+                      }
+                  }
+                  Spacer(Modifier.height(16.dp))
+                  if (log.isNotEmpty()) {
+                      Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(cs.surfaceVariant).padding(12.dp)) {
+                          Text(
+                              log.takeLast(8).joinToString("\n"),
+                              fontFamily = FontFamily.Monospace, fontSize = 11.sp, lineHeight = 15.sp,
+                              color = cs.onSurfaceVariant, maxLines = 8, overflow = TextOverflow.Ellipsis
+                          )
+                      }
+                      Spacer(Modifier.height(16.dp))
+                  }
+                  if (phase == InstallState.Phase.ERROR) {
+                      Text(err, color = cs.error, textAlign = TextAlign.Center)
+                      Spacer(Modifier.height(12.dp))
+                      Button(
+                          onClick = { startInstall(ctx) },
+                          colors = ButtonDefaults.buttonColors(containerColor = C.brand, contentColor = Color.White)
+                      ) { Text("Tentar novamente") }
+                  }
+                  TextButton(onClick = onSettings) { Text("Configurar Gateway / chave enquanto instala", color = C.brand) }
+              }
+          }
+
+          // ------------------------------------------------------------ Chat
+          @Composable
+          fun ChatScreen(vm: ChatVM, onSettings: () -> Unit) {
+              val cs = MaterialTheme.colorScheme
+              val listState = rememberLazyListState()
+              var input by remember { mutableStateOf("") }
+              val lastIdx = (vm.items.size - 1) + (if (vm.running) 1 else 0)
+              LaunchedEffect(vm.items.size, vm.running) {
+                  if (lastIdx >= 0) listState.animateScrollToItem(lastIdx)
+              }
+              Column(Modifier.fillMaxSize().imePadding()) {
+                  Row(
+                      Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Spark(22.dp, spin = vm.running)
+                      Spacer(Modifier.width(10.dp))
+                      Text("Claude Code", fontFamily = FontFamily.Serif, fontSize = 20.sp, modifier = Modifier.weight(1f))
+                      IconButton(onClick = { vm.newChat(); input = "" }, enabled = vm.items.isNotEmpty()) {
+                          Icon(Icons.Default.Edit, "Nova conversa", tint = cs.onSurfaceVariant)
+                      }
+                      IconButton(onClick = onSettings) {
+                          Icon(Icons.Default.Settings, "Ajustes", tint = cs.onSurfaceVariant)
+                      }
+                  }
+                  Box(Modifier.weight(1f).fillMaxWidth()) {
+                      if (vm.items.isEmpty()) {
+                          Welcome(onPick = { input = it }, onSettings = onSettings)
+                      } else {
+                          LazyColumn(
+                              state = listState, modifier = Modifier.fillMaxSize(),
+                              contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+                              verticalArrangement = Arrangement.spacedBy(14.dp)
+                          ) {
+                              items(vm.items, key = { it.id }) { m -> ItemView(m) }
+                              if (vm.running) item { Spark(20.dp, spin = true) }
+                          }
+                      }
+                  }
+                  InputBar(
+                      value = input, onChange = { input = it }, running = vm.running,
+                      onSend = { val t = input; input = ""; vm.send(t) },
+                      onStop = { vm.stop() }
+                  )
+              }
+          }
+
+          @Composable
+          fun Welcome(onPick: (String) -> Unit, onSettings: () -> Unit) {
+              val ctx = LocalContext.current
+              val cs = MaterialTheme.colorScheme
+              val needsAuth = remember { Prefs(ctx).token.isBlank() }
+              Column(
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
+              ) {
+                  Spark(56.dp)
+                  Spacer(Modifier.height(18.dp))
+                  Text("Como posso ajudar hoje?", fontFamily = FontFamily.Serif, fontSize = 30.sp, textAlign = TextAlign.Center)
+                  Spacer(Modifier.height(6.dp))
+                  Text(
+                      "O Claude Code roda dentro do seu celular, na pasta /root/workspace.",
+                      color = cs.onSurfaceVariant, textAlign = TextAlign.Center, fontSize = 14.sp
+                  )
+                  Spacer(Modifier.height(22.dp))
+                  if (needsAuth) {
+                      Surface(
+                          shape = RoundedCornerShape(16.dp), color = cs.surface,
+                          border = BorderStroke(1.dp, C.brand), modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Column(Modifier.padding(16.dp)) {
+                              Text("Falta configurar a autenticação", fontWeight = FontWeight.SemiBold)
+                              Spacer(Modifier.height(4.dp))
+                              Text("Informe sua API key, token OAuth ou o seu Gateway.", color = cs.onSurfaceVariant, fontSize = 14.sp)
+                              TextButton(onClick = onSettings) { Text("Abrir ajustes", color = C.brand) }
+                          }
+                      }
+                      Spacer(Modifier.height(14.dp))
+                  }
+                  listOf(
+                      "Crie um projeto Node.js com um servidor HTTP simples",
+                      "Liste os arquivos da pasta atual e explique o que há nela",
+                      "Escreva um script Python que renomeia arquivos em lote"
+                  ).forEach { s ->
+                      Surface(
+                          shape = RoundedCornerShape(14.dp), color = cs.surface,
+                          border = BorderStroke(1.dp, cs.outline),
+                          modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { onPick(s) }
+                      ) { Text(s, Modifier.padding(14.dp), fontSize = 14.sp) }
+                  }
+              }
+          }
+
+          @Composable
+          fun ItemView(m: Item) {
+              val cs = MaterialTheme.colorScheme
+              when (m) {
+                  is UserMsg -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                      Box(
+                          Modifier.widthIn(max = 320.dp).clip(RoundedCornerShape(20.dp))
+                              .background(cs.surfaceVariant).padding(horizontal = 16.dp, vertical = 11.dp)
+                      ) {
+                          SelectionContainer { Text(m.text, fontSize = 16.sp, lineHeight = 23.sp, color = cs.onBackground) }
+                      }
+                  }
+                  is AsstMsg -> SelectionContainer { Markdown(m.text) }
+                  is ToolMsg -> Row(
+                      Modifier.clip(RoundedCornerShape(12.dp)).background(cs.surface)
+                          .border(1.dp, cs.outline, RoundedCornerShape(12.dp))
+                          .padding(horizontal = 12.dp, vertical = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text(m.name, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = C.brand)
+                      if (m.detail.isNotBlank()) {
+                          Spacer(Modifier.width(8.dp))
+                          Text(
+                              m.detail, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = cs.onSurfaceVariant,
+                              maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false)
+                          )
+                      }
+                  }
+                  is ErrMsg -> Box(
+                      Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                          .background(cs.error.copy(alpha = 0.1f)).padding(14.dp)
+                  ) { SelectionContainer { Text(m.text, color = cs.error, fontSize = 14.sp) } }
+              }
+          }
+
+          // ------------------------------------------------------------ Markdown leve
+          @Composable
+          fun Markdown(text: String) {
+              val cs = MaterialTheme.colorScheme
+              val parts = text.split("```")
+              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                  parts.forEachIndexed { i, p ->
+                      if (i % 2 == 1) {
+                          CodeBlock(p.substringAfter('\n', p).trimEnd('\n'))
+                      } else if (p.isNotBlank()) {
+                          Text(
+                              mdInline(p.trim('\n'), cs.surfaceVariant),
+                              fontFamily = FontFamily.Serif, fontSize = 16.sp, lineHeight = 25.sp, color = cs.onBackground
+                          )
+                      }
+                  }
+              }
+          }
+
+          fun mdInline(src: String, codeBg: Color): AnnotatedString = buildAnnotatedString {
+              val head = Regex("^#{1,6}\\s+")
+              val bullet = Regex("^\\s*[-*]\\s+")
+              src.lines().forEachIndexed { li, raw ->
+                  if (li > 0) append("\n")
+                  var line = raw
+                  val h = head.find(line)
+                  if (h != null) {
+                      line = line.substring(h.value.length)
+                      withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 18.sp)) { mdSpan(line, codeBg) }
+                  } else {
+                      val b = bullet.find(line)
+                      if (b != null) { append("•  "); line = line.substring(b.value.length) }
+                      mdSpan(line, codeBg)
+                  }
+              }
+          }
+
+          private fun AnnotatedString.Builder.mdSpan(s: String, codeBg: Color) {
+              var i = 0
+              while (i < s.length) {
+                  if (s.startsWith("**", i)) {
+                      val e = s.indexOf("**", i + 2)
+                      if (e > 0) {
+                          withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(s.substring(i + 2, e)) }
+                          i = e + 2; continue
+                      }
+                  }
+                  if (s[i] == '`') {
+                      val e = s.indexOf('`', i + 1)
+                      if (e > 0) {
+                          withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBg, fontSize = 14.sp)) {
+                              append(s.substring(i + 1, e))
+                          }
+                          i = e + 1; continue
+                      }
+                  }
+                  append(s[i]); i++
+              }
+          }
+
+          @Composable
+          fun CodeBlock(code: String) {
+              val cs = MaterialTheme.colorScheme
+              val clip = LocalClipboardManager.current
+              var copied by remember { mutableStateOf(false) }
+              Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(cs.surfaceVariant)) {
+                  Row(Modifier.fillMaxWidth().padding(end = 4.dp), horizontalArrangement = Arrangement.End) {
+                      TextButton(onClick = { clip.setText(AnnotatedString(code)); copied = true }) {
+                          Text(if (copied) "Copiado" else "Copiar", fontSize = 12.sp, color = cs.onSurfaceVariant)
+                      }
+                  }
+                  Box(Modifier.horizontalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, bottom = 12.dp)) {
+                      Text(code, fontFamily = FontFamily.Monospace, fontSize = 13.sp, lineHeight = 18.sp, color = cs.onBackground)
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------ Barra de entrada
+          @Composable
+          fun InputBar(value: String, onChange: (String) -> Unit, running: Boolean, onSend: () -> Unit, onStop: () -> Unit) {
+              val cs = MaterialTheme.colorScheme
+              val active = running || value.isNotBlank()
+              Surface(
+                  shape = RoundedCornerShape(26.dp), color = cs.surface,
+                  border = BorderStroke(1.dp, cs.outline), shadowElevation = 2.dp,
+                  modifier = Modifier.padding(12.dp).fillMaxWidth()
+              ) {
+                  Row(Modifier.padding(start = 18.dp, end = 8.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.Bottom) {
+                      Box(Modifier.weight(1f).padding(vertical = 10.dp)) {
+                          if (value.isEmpty()) Text("Peça algo ao Claude Code…", color = cs.onSurfaceVariant, fontSize = 16.sp)
+                          BasicTextField(
+                              value = value, onValueChange = onChange,
+                              textStyle = TextStyle(color = cs.onSurface, fontSize = 16.sp),
+                              cursorBrush = SolidColor(C.brand), maxLines = 6, modifier = Modifier.fillMaxWidth()
+                          )
+                      }
+                      Spacer(Modifier.width(8.dp))
+                      Box(
+                          Modifier.size(40.dp).clip(CircleShape)
+                              .background(if (active) C.brand else cs.outline)
+                              .clickable(enabled = active) { if (running) onStop() else onSend() },
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Canvas(Modifier.size(16.dp)) {
+                              val w = size.width; val h = size.height; val sw = 2.2.dp.toPx()
+                              if (running) {
+                                  drawRoundRect(Color.White, cornerRadius = CornerRadius(3.dp.toPx()))
+                              } else {
+                                  drawLine(Color.White, Offset(w / 2, h), Offset(w / 2, 0f), sw, StrokeCap.Round)
+                                  drawLine(Color.White, Offset(0f, h * 0.45f), Offset(w / 2, 0f), sw, StrokeCap.Round)
+                                  drawLine(Color.White, Offset(w, h * 0.45f), Offset(w / 2, 0f), sw, StrokeCap.Round)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------ Ajustes
+          @Composable
+          fun Field(
+              label: String, value: String, onChange: (String) -> Unit, hint: String = "",
+              multi: Boolean = false, secret: Boolean = false, kb: KeyboardType = KeyboardType.Text
+          ) {
+              val cs = MaterialTheme.colorScheme
+              var show by remember { mutableStateOf(false) }
+              OutlinedTextField(
+                  value = value, onValueChange = onChange, modifier = Modifier.fillMaxWidth(),
+                  label = { Text(label) },
+                  placeholder = { if (hint.isNotEmpty()) Text(hint, color = cs.onSurfaceVariant.copy(alpha = 0.6f)) },
+                  singleLine = !multi, minLines = if (multi) 3 else 1,
+                  visualTransformation = if (secret && !show) PasswordVisualTransformation() else VisualTransformation.None,
+                  keyboardOptions = KeyboardOptions(keyboardType = if (secret) KeyboardType.Password else kb, autoCorrect = false),
+                  trailingIcon = {
+                      if (secret) TextButton(onClick = { show = !show }) {
+                          Text(if (show) "Ocultar" else "Mostrar", color = C.brand, fontSize = 12.sp)
+                      }
+                  },
+                  shape = RoundedCornerShape(14.dp),
+                  colors = OutlinedTextFieldDefaults.colors(
+                      focusedBorderColor = C.brand, focusedLabelColor = C.brand, cursorColor = C.brand,
+                      unfocusedBorderColor = cs.outline,
+                      focusedContainerColor = cs.surface, unfocusedContainerColor = cs.surface
+                  )
+              )
+          }
+
+          @Composable
+          fun Section(t: String) {
+              Text(
+                  t, fontFamily = FontFamily.Serif, fontSize = 20.sp,
+                  modifier = Modifier.padding(top = 14.dp)
+              )
+          }
+
+          @Composable
+          fun Choice(selected: Boolean, title: String, desc: String, onClick: () -> Unit) {
+              val cs = MaterialTheme.colorScheme
+              Surface(
+                  shape = RoundedCornerShape(14.dp), color = cs.surface,
+                  border = BorderStroke(if (selected) 1.5.dp else 1.dp, if (selected) C.brand else cs.outline),
+                  modifier = Modifier.fillMaxWidth().clickable { onClick() }
+              ) {
+                  Column(Modifier.padding(14.dp)) {
+                      Text(title, fontWeight = FontWeight.SemiBold, color = if (selected) C.brand else cs.onSurface)
+                      Text(desc, fontSize = 13.sp, color = cs.onSurfaceVariant)
+                  }
+              }
+          }
+
+          fun testGateway(base: String, mode: String, token: String, model: String, headers: String): String {
+              return try {
+                  val root = base.trim().ifBlank { "https://api.anthropic.com" }.trimEnd('/')
+                  val c = java.net.URL("$root/v1/messages").openConnection() as java.net.HttpURLConnection
+                  c.requestMethod = "POST"; c.connectTimeout = 15000; c.readTimeout = 30000; c.doOutput = true
+                  c.setRequestProperty("content-type", "application/json")
+                  c.setRequestProperty("anthropic-version", "2023-06-01")
+                  when (mode) {
+                      "apikey" -> c.setRequestProperty("x-api-key", token.trim())
+                      "oauth" -> {
+                          c.setRequestProperty("authorization", "Bearer ${token.trim()}")
+                          c.setRequestProperty("anthropic-beta", "oauth-2025-04-20")
+                      }
+                      else -> c.setRequestProperty("authorization", "Bearer ${token.trim()}")
+                  }
+                  headers.lines().forEach { l ->
+                      val i = l.indexOf(':')
+                      if (i > 0) c.setRequestProperty(l.substring(0, i).trim(), l.substring(i + 1).trim())
+                  }
+                  val m = model.trim().ifBlank { "claude-haiku-5-5" }
+                  val body = JSONObject().put("model", m).put("max_tokens", 1)
+                      .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", "ping")))
+                      .toString()
+                  c.outputStream.use { it.write(body.toByteArray()) }
+                  val code = c.responseCode
+                  val txt = (if (code in 200..299) c.inputStream else c.errorStream)?.bufferedReader()?.readText().orEmpty()
+                  if (code in 200..299) "✓ Conexão OK (HTTP $code)" else "✗ HTTP $code — ${txt.take(240)}"
+              } catch (e: Exception) {
+                  "✗ ${e.javaClass.simpleName}: ${e.message}"
+              }
+          }
+
+          @Composable
+          fun SettingsScreen(onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val cs = MaterialTheme.colorScheme
+              val p = remember { Prefs(ctx) }
+              var base by remember { mutableStateOf(p.baseUrl) }
+              var mode by remember { mutableStateOf(p.authMode) }
+              var token by remember { mutableStateOf(p.token) }
+              var model by remember { mutableStateOf(p.model) }
+              var headers by remember { mutableStateOf(p.headers) }
+              var extra by remember { mutableStateOf(p.extraEnv) }
+              var perm by remember { mutableStateOf(p.permMode) }
+              var msg by remember { mutableStateOf("") }
+              var testing by remember { mutableStateOf(false) }
+              var confirmReset by remember { mutableStateOf(false) }
+              var saved by remember { mutableStateOf(false) }
+              val scope = rememberCoroutineScope()
+              val version by InstallState.version.collectAsState()
+
+              fun save() {
+                  p.baseUrl = base.trim(); p.authMode = mode; p.token = token.trim(); p.model = model.trim()
+                  p.headers = headers.trim(); p.extraEnv = extra.trim(); p.permMode = perm
+                  saved = true
+              }
+
+              fun reinstall(wipe: Boolean) {
+                  if (InstallState.phase.value == InstallState.Phase.RUNNING || BgService.installing) return
+                  scope.launch {
+                      withContext(Dispatchers.IO) {
+                          val e = Env(ctx)
+                          if (wipe) { rmrf(e.root); e.rootOk.delete() }
+                          e.okFile.delete()
+                      }
+                      InstallState.ready.value = false
+                      startInstall(ctx)
+                      onBack()
+                  }
+              }
+
+              Column(Modifier.fillMaxSize()) {
+                  Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar") }
+                      Text("Ajustes", fontFamily = FontFamily.Serif, fontSize = 22.sp)
+                  }
+                  Column(
+                      Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      Section("Gateway / API")
+                      Text(
+                          "Deixe a URL em branco para usar a API oficial. Em um Gateway (LiteLLM, proxy corporativo, Bedrock/Vertex via proxy…) informe a URL base sem /v1.",
+                          fontSize = 13.sp, color = cs.onSurfaceVariant
+                      )
+                      Field("URL base (ANTHROPIC_BASE_URL)", base, { base = it; saved = false }, "https://api.anthropic.com", kb = KeyboardType.Uri)
+                      Text("Autenticação", fontSize = 13.sp, color = cs.onSurfaceVariant)
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          listOf("bearer" to "Bearer", "apikey" to "API Key", "oauth" to "OAuth").forEach { (k, l) ->
+                              FilterChip(
+                                  selected = mode == k, onClick = { mode = k; saved = false }, label = { Text(l) },
+                                  colors = FilterChipDefaults.filterChipColors(
+                                      selectedContainerColor = C.brand.copy(alpha = 0.15f), selectedLabelColor = C.brand
+                                  )
+                              )
+                          }
+                      }
+                      Text(
+                          when (mode) {
+                              "apikey" -> "Enviado como x-api-key (ANTHROPIC_API_KEY)."
+                              "oauth" -> "Token da sua assinatura: gere com  claude setup-token  (CLAUDE_CODE_OAUTH_TOKEN)."
+                              else -> "Enviado como Authorization: Bearer (ANTHROPIC_AUTH_TOKEN). Padrão para gateways."
+                          },
+                          fontSize = 12.sp, color = cs.onSurfaceVariant
+                      )
+                      Field("Token / chave", token, { token = it; saved = false }, secret = true)
+                      Field("Modelo (opcional)", model, { model = it; saved = false }, "ex.: claude-sonnet-5-5")
+                      Field("Cabeçalhos extras", headers, { headers = it; saved = false }, "Nome: valor (um por linha)", multi = true)
+                      Field("Variáveis de ambiente extras", extra, { extra = it; saved = false }, "CHAVE=valor (uma por linha)", multi = true)
+                      OutlinedButton(
+                          enabled = !testing,
+                          onClick = {
+                              testing = true; msg = "Testando…"
+                              scope.launch {
+                                  msg = withContext(Dispatchers.IO) { testGateway(base, mode, token, model, headers) }
+                                  testing = false
+                              }
+                          }
+                      ) { Text("Testar conexão", color = C.brand) }
+                      if (msg.isNotEmpty()) {
+                          SelectionContainer {
+                              Text(msg, fontSize = 13.sp, color = if (msg.startsWith("✓")) C.brand else cs.onSurfaceVariant)
+                          }
+                      }
+
+                      Section("Permissões do Claude Code")
+                      Choice(perm == "acceptEdits", "Aceitar edições (recomendado)", "Pode ler, editar, escrever e rodar comandos Bash na pasta de trabalho.") { perm = "acceptEdits"; saved = false }
+                      Choice(perm == "plan", "Somente planejar", "Analisa e propõe um plano, sem alterar nada.") { perm = "plan"; saved = false }
+                      Choice(perm == "bypass", "Tudo liberado", "Sem pedidos de confirmação. Roda isolado no Linux embutido do app.") { perm = "bypass"; saved = false }
+
+                      Section("Ambiente")
+                      Text(
+                          if (version.isNotBlank()) "Instalado: $version" else "Claude Code ainda não instalado.",
+                          fontSize = 14.sp, color = cs.onSurfaceVariant
+                      )
+                      OutlinedButton(onClick = { reinstall(false) }) { Text("Atualizar Claude Code", color = C.brand) }
+                      OutlinedButton(onClick = { confirmReset = true }) { Text("Reinstalar do zero", color = cs.error) }
+                      Spacer(Modifier.height(8.dp))
+                  }
+                  Button(
+                      onClick = { save() },
+                      modifier = Modifier.fillMaxWidth().padding(16.dp).height(50.dp),
+                      shape = RoundedCornerShape(25.dp),
+                      colors = ButtonDefaults.buttonColors(containerColor = C.brand, contentColor = Color.White)
+                  ) { Text(if (saved) "Salvo ✓" else "Salvar", fontSize = 16.sp) }
+              }
+
+              if (confirmReset) {
+                  AlertDialog(
+                      onDismissRequest = { confirmReset = false },
+                      title = { Text("Reinstalar do zero?") },
+                      text = { Text("Apaga o Linux embutido, a pasta /root/workspace e tudo que foi instalado. Os ajustes são mantidos.") },
+                      confirmButton = { TextButton(onClick = { confirmReset = false; reinstall(true) }) { Text("Apagar e reinstalar", color = cs.error) } },
+                      dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Cancelar") } }
+                  )
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------
+      # 6) Assinatura + build + verificação
+      # ------------------------------------------------------------
+      - name: Keystore
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KS_B64:-}" ]; then
+            echo "$KS_B64" | base64 -d > "$KEYSTORE_PATH"
+            echo "Usando keystore dos secrets"
+          else
+            keytool -genkeypair -keystore "$KEYSTORE_PATH" -storetype PKCS12 \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Claude Code Mobile, O=Local"
+            echo "Keystore temporaria gerada (adicione os secrets para manter a mesma assinatura)"
+          fi
+
+      - name: Compilar APK
+        run: gradle -p android --no-daemon --stacktrace assembleRelease
+
+      - name: Verificar APK
+        run: |
+          set -euo pipefail
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          test -f "$APK"
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --verbose "$APK"
+          unzip -l "$APK" | grep -q 'assets/rootfs.tar.gz'
+          mkdir -p out
+          cp "$APK" out/ClaudeCodeMobile.apk
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeCodeMobile-apk
+          path: out/ClaudeCodeMobile.apk
+          if-no-files-found: error
